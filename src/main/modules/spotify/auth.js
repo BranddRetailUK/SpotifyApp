@@ -9,7 +9,15 @@ const { startCallbackServer } = require('../../util/http-callback');
 
 const AUTH_BASE = 'https://accounts.spotify.com';
 const API_BASE = 'https://api.spotify.com/v1';
-const REDIRECT = 'http://localhost:43563/callback';
+
+// 👇 Your default Client ID (can be overridden via settings or function arg)
+const DEFAULT_CLIENT_ID = '60de01579db04f0a93d46a7d5c7b5f28';
+
+// Helper: prefer a redirect URI from settings, else default to localhost for Electron
+function getRedirectUri() {
+  const s = load();
+  return (s.spotify && s.spotify.redirect_uri) || 'http://localhost:43563/callback';
+}
 
 function b64url(buf) {
   return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -45,45 +53,56 @@ async function exchangeToken(params) {
 
 /**
  * Launches Spotify OAuth (PKCE). Stores tokens in settings.
- * @param {string} clientId
- * @param {string[]} scopes
- * @returns {Promise<{access_token:string, access_expires_at:number, refresh_token_enc?:string, clientId:string}>}
+ * @param {string} [clientId] - optional; defaults to DEFAULT_CLIENT_ID or settings.spotify.clientId
+ * @param {string[]} [scopes] - optional scope list
+ * @returns {Promise<{access_token:string, access_expires_at:number, refresh_token_enc?:string, clientId:string, redirect_uri:string}>}
  */
 async function login(clientId, scopes = []) {
-  if (!clientId) throw new Error('spotify.login: clientId is required');
+  const s = load();
+  const effectiveClientId = String(clientId || s?.spotify?.clientId || DEFAULT_CLIENT_ID).trim();
+  if (!effectiveClientId) throw new Error('spotify.login: clientId is required');
 
+  const redirect = getRedirectUri();
   const { verifier, challenge } = pkcePair();
   const state = b64url(crypto.randomBytes(16));
 
   const authUrl = new URL(`${AUTH_BASE}/authorize`);
-  authUrl.searchParams.set('client_id', clientId);
+  authUrl.searchParams.set('client_id', effectiveClientId);
   authUrl.searchParams.set('response_type', 'code');
-  authUrl.searchParams.set('redirect_uri', REDIRECT);
+  authUrl.searchParams.set('redirect_uri', redirect);
   authUrl.searchParams.set('code_challenge_method', 'S256');
   authUrl.searchParams.set('code_challenge', challenge);
   authUrl.searchParams.set('state', state);
   authUrl.searchParams.set('scope', scopes.join(' '));
 
-  // Open system browser using Electron (CJS-safe)
+  // Open system browser
   await shell.openExternal(authUrl.toString());
 
-  // Wait for local callback
-  const cb = await startCallbackServer('/callback', 43563);
-  if (cb.state !== state) throw new Error('State mismatch in Spotify OAuth');
+  // Local callback server only when using localhost redirect
+  let cb;
+  if (redirect.startsWith('http://localhost')) {
+    cb = await startCallbackServer('/callback', 43563);
+    if (cb.state !== state) throw new Error('State mismatch in Spotify OAuth');
+  } else {
+    throw new Error(
+      'Non-local redirect_uri configured. Implement a server-side /callback to exchange the code, then hand tokens to the app.'
+    );
+  }
 
-  // Exchange authorization code for tokens
+  // Exchange code for tokens
   const token = await exchangeToken({
     grant_type: 'authorization_code',
     code: cb.code,
-    redirect_uri: REDIRECT,
-    client_id: clientId,
+    redirect_uri: redirect,
+    client_id: effectiveClientId,
     code_verifier: verifier
   });
 
   const secret = getOrInitCryptoSecret();
   const stored = {
     spotify: {
-      clientId,
+      clientId: effectiveClientId,
+      redirect_uri: redirect,
       access_token: token.access_token,
       access_expires_at: Date.now() + (token.expires_in - 30) * 1000,
       refresh_token_enc: token.refresh_token
@@ -113,7 +132,7 @@ async function getAccessToken() {
   const res = await exchangeToken({
     grant_type: 'refresh_token',
     refresh_token,
-    client_id: s.spotify.clientId
+    client_id: s.spotify.clientId || DEFAULT_CLIENT_ID
   });
 
   const next = {
@@ -130,4 +149,4 @@ async function getAccessToken() {
   return next.spotify.access_token;
 }
 
-module.exports = { login, getAccessToken, API_BASE };
+module.exports = { login, getAccessToken, API_BASE, DEFAULT_CLIENT_ID };
